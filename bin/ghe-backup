@@ -41,9 +41,6 @@ done
 # shellcheck source=share/github-backup-utils/ghe-backup-config
 . "$( dirname "${BASH_SOURCE[0]}" )/../share/github-backup-utils/ghe-backup-config"
 
-# Used to record failed backup steps
-failures=
-
 # CPU and IO throttling to keep backups from thrashing around.
 export GHE_NICE=${GHE_NICE:-"nice -n 19"}
 export GHE_IONICE=${GHE_IONICE:-"ionice -c 3"}
@@ -159,63 +156,56 @@ bm_init > /dev/null
 ghe-backup-store-version  ||
 echo "Warning: storing backup-utils version remotely failed."
 
-echo "Backing up GitHub settings ..."
-ghe-backup-settings || failures="$failures settings"
+# Execute long running backup jobs in parallel
+parallel_commands="
+ghe-backup-settings
+ghe-ssh \"$GHE_HOSTNAME\" -- 'ghe-export-authorized-keys' > authorized-keys.json
+ghe-ssh \"$GHE_HOSTNAME\" -- 'ghe-export-ssh-host-keys' > ssh-host-keys.tar
+ghe-backup-mysql
+ghe-backup-redis > redis.rdb
+ghe-backup-es-audit-log;
+ghe-backup-es-hookshot
+ghe-backup-repositories
+ghe-backup-storage
+ghe-backup-git-hooks"
 
-echo "Backing up SSH authorized keys ..."
-bm_start "ghe-export-authorized-keys"
-ghe-ssh "$GHE_HOSTNAME" -- 'ghe-export-authorized-keys' > authorized-keys.json ||
-failures="$failures authorized-keys"
-bm_end "ghe-export-authorized-keys"
+echo "Backing up GitHub settings ...
+Backing up SSH authorized keys ...
+Backing up SSH host keys ...
+Backing up MySQL database ...
+Backing up Redis database ..
+Backing up audit log ...
+Backing up hookshot logs ...
+Backing up Git repositories ...
+Backing up storage data ...
+Backing up custom Git hooks ..."
 
-echo "Backing up SSH host keys ..."
-bm_start "ghe-export-ssh-host-keys"
-ghe-ssh "$GHE_HOSTNAME" -- 'ghe-export-ssh-host-keys' > ssh-host-keys.tar ||
-failures="$failures ssh-host-keys"
-bm_end "ghe-export-ssh-host-keys"
-
-echo "Backing up MySQL database ..."
-ghe-backup-mysql || failures="$failures mysql"
-
-echo "Backing up Redis database ..."
-ghe-backup-redis > redis.rdb || failures="$failures redis"
-
-echo "Backing up audit log ..."
-ghe-backup-es-audit-log || failures="$failures audit-log"
-
-echo "Backing up hookshot logs ..."
-ghe-backup-es-hookshot || failures="$failures hookshot"
-
-echo "Backing up Git repositories ..."
-ghe-backup-repositories || failures="$failures repositories"
-
-if [ "$GHE_BACKUP_SKIP_PAGES" = "yes" ]; then
-  echo "Skipping backup of GitHub Pages artifacts ..."
-else
+if [ "$GHE_BACKUP_SKIP_PAGES" != "yes" ]; then
   echo "Backing up GitHub Pages artifacts ..."
-  ghe-backup-pages || failures="$failures pages"
+  parallel_commands+=$'\nghe-backup-pages'
 fi
 
-echo "Backing up storage data ..."
-ghe-backup-storage || failures="$failures storage"
-
-echo "Backing up custom Git hooks ..."
-ghe-backup-git-hooks || failures="$failures git-hooks"
-
-if [ "$GHE_BACKUP_STRATEGY" = "rsync" ]; then
-  echo "Backing up Elasticsearch indices ..."
-  ghe-backup-es-rsync || failures="$failures elasticsearch"
+if [ "$GHE_BACKUP_STRATEGY" = "rsync" ]; then 
+  echo "Backing up Elasticsearch indices ...";
+  parallel_commands+=$'\nghe-backup-es-rsync'
 fi
+
+parallel_jobs_log_path="ghe-backup-parallel-job.log"
+
+# Run the commands in parallel
+parallel_jobs_succeeded=true
+echo "${parallel_commands}" | parallel --will-cite --joblog "$parallel_jobs_log_path" || parallel_jobs_succeeded=false
 
 # git fsck repositories after the backup
+fsck_passed=true
 if [ "$GHE_BACKUP_FSCK" = "yes" ]; then
-  ghe-backup-fsck $GHE_SNAPSHOT_DIR || failures="$failures fsck"
+  ghe-backup-fsck $GHE_SNAPSHOT_DIR || fsck_passed=false
 fi
 
 # If everything was successful, mark the snapshot as complete, update the
 # current symlink to point to the new snapshot and prune expired and failed
 # snapshots.
-if [ -z "$failures" ]; then
+if $parallel_jobs_succeeded && $fsck_passed; then
   rm "incomplete"
 
   rm -f "../current"
@@ -227,12 +217,24 @@ fi
 echo "Completed backup of $GHE_HOSTNAME in snapshot $GHE_SNAPSHOT_TIMESTAMP at $(date +"%H:%M:%S")"
 
 # Exit non-zero and list the steps that failed.
-if [ -z "$failures" ]; then
+if $parallel_jobs_succeeded && $fsck_passed; then
   ghe_remote_logger "Completed backup from $(hostname) / snapshot $GHE_SNAPSHOT_TIMESTAMP successfully."
 else
-  steps="$(echo $failures | sed 's/ /, /g')"
-  ghe_remote_logger "Completed backup from $(hostname) / snapshot $GHE_SNAPSHOT_TIMESTAMP with failures: ${steps}."
-  echo "Error: Snapshot incomplete. Some steps failed: ${steps}. "
+  ghe_remote_logger "Completed backup from $(hostname) / snapshot $GHE_SNAPSHOT_TIMESTAMP with failures."
+  echo "Error: Snapshot incomplete. Some steps failed."
+
+  if ! $fsck_passed; then
+    error_msg="git fsck on backed up repositories failed"
+    ghe_remote_logger "$error_msg"
+    echo "$error_msg"
+  fi
+
+  if ! $parallel_jobs_succeeded; then
+    parallel_jobs_log=$(cat "$parallel_jobs_log_path")
+    ghe_remote_logger "$parallel_jobs_log"
+    echo "$parallel_jobs_log"
+  fi
+
   exit 1
 fi
 
